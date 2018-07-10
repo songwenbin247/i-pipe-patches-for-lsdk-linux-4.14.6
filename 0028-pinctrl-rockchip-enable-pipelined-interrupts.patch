@@ -1,0 +1,86 @@
+From 47bf0af0345c63b4824b37930f0f7bc4de6ec9d2 Mon Sep 17 00:00:00 2001
+From: Dmitriy Cherkasov <dmitriy@oss-tech.org>
+Date: Thu, 28 Dec 2017 20:20:33 -0800
+Subject: [PATCH 28/29] pinctrl: rockchip: enable pipelined interrupts
+
+---
+ drivers/pinctrl/pinctrl-rockchip.c | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pinctrl/pinctrl-rockchip.c b/drivers/pinctrl/pinctrl-rockchip.c
+index b5cb7858f..26d7af3c6 100644
+--- a/drivers/pinctrl/pinctrl-rockchip.c
++++ b/drivers/pinctrl/pinctrl-rockchip.c
+@@ -40,6 +40,7 @@
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ #include <dt-bindings/pinctrl/rockchip.h>
++#include <linux/ipipe.h>
+ 
+ #include "core.h"
+ #include "pinconf.h"
+@@ -164,7 +165,7 @@ struct rockchip_pin_bank {
+ 	struct irq_domain		*domain;
+ 	struct gpio_chip		gpio_chip;
+ 	struct pinctrl_gpio_range	grange;
+-	raw_spinlock_t			slock;
++	ipipe_spinlock_t		slock;
+ 	u32				toggle_edge_mode;
+ 	u32				recalced_mask;
+ 	u32				route_mask;
+@@ -2615,7 +2616,7 @@ static void rockchip_irq_demux(struct irq_desc *desc)
+ 			} while ((data & BIT(irq)) != (data_old & BIT(irq)));
+ 		}
+ 
+-		generic_handle_irq(virq);
++		ipipe_handle_demuxed_irq(virq);
+ 	}
+ 
+ 	chained_irq_exit(chip, desc);
+@@ -2629,7 +2630,7 @@ static int rockchip_irq_set_type(struct irq_data *d, unsigned int type)
+ 	u32 polarity;
+ 	u32 level;
+ 	u32 data;
+-	unsigned long flags;
++	unsigned long flags, gcflags;
+ 	int ret;
+ 
+ 	/* make sure the pin is configured as gpio input */
+@@ -2652,7 +2653,7 @@ static int rockchip_irq_set_type(struct irq_data *d, unsigned int type)
+ 		irq_set_handler_locked(d, handle_level_irq);
+ 
+ 	raw_spin_lock_irqsave(&bank->slock, flags);
+-	irq_gc_lock(gc);
++	gcflags = irq_gc_lock(gc);
+ 
+ 	level = readl_relaxed(gc->reg_base + GPIO_INTTYPE_LEVEL);
+ 	polarity = readl_relaxed(gc->reg_base + GPIO_INT_POLARITY);
+@@ -2693,7 +2694,7 @@ static int rockchip_irq_set_type(struct irq_data *d, unsigned int type)
+ 		polarity &= ~mask;
+ 		break;
+ 	default:
+-		irq_gc_unlock(gc);
++		irq_gc_unlock(gc, gcflags);
+ 		raw_spin_unlock_irqrestore(&bank->slock, flags);
+ 		clk_disable(bank->clk);
+ 		return -EINVAL;
+@@ -2702,7 +2703,7 @@ static int rockchip_irq_set_type(struct irq_data *d, unsigned int type)
+ 	writel_relaxed(level, gc->reg_base + GPIO_INTTYPE_LEVEL);
+ 	writel_relaxed(polarity, gc->reg_base + GPIO_INT_POLARITY);
+ 
+-	irq_gc_unlock(gc);
++	irq_gc_unlock(gc, gcflags);
+ 	raw_spin_unlock_irqrestore(&bank->slock, flags);
+ 	clk_disable(bank->clk);
+ 
+@@ -2814,6 +2815,7 @@ static int rockchip_interrupts_register(struct platform_device *pdev,
+ 		gc->chip_types[0].chip.irq_suspend = rockchip_irq_suspend;
+ 		gc->chip_types[0].chip.irq_resume = rockchip_irq_resume;
+ 		gc->chip_types[0].chip.irq_set_type = rockchip_irq_set_type;
++		gc->chip_types[0].chip.flags = IRQCHIP_PIPELINE_SAFE;
+ 		gc->wake_enabled = IRQ_MSK(bank->nr_pins);
+ 
+ 		irq_set_chained_handler_and_data(bank->irq,
+-- 
+2.17.1
+

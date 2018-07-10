@@ -1,0 +1,336 @@
+From 3a7b5f52c388db77cd0b649ab4837954b2ba9727 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 3 Dec 2017 11:55:42 +0100
+Subject: [PATCH 07/29] clocksource, clockevents: ipipe: enable pipelined ticks
+ and timekeeping
+
+---
+ include/linux/clockchips.h          |   9 +++
+ include/linux/clocksource.h         |   3 +
+ include/linux/timekeeper_internal.h |   2 +-
+ include/linux/timekeeping.h         |   8 +++
+ kernel/time/clockevents.c           |   3 +
+ kernel/time/clocksource.c           | 108 ++++++++++++++++++++++++++++
+ kernel/time/tick-common.c           |   2 +-
+ kernel/time/tick-sched.c            |   2 +-
+ kernel/time/timekeeping.c           |   2 +-
+ kernel/time/timer.c                 |  19 +++++
+ 10 files changed, 154 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/clockchips.h b/include/linux/clockchips.h
+index 8ae9a95eb..ab59237a8 100644
+--- a/include/linux/clockchips.h
++++ b/include/linux/clockchips.h
+@@ -129,6 +129,15 @@ struct clock_event_device {
+ 	const struct cpumask	*cpumask;
+ 	struct list_head	list;
+ 	struct module		*owner;
++
++#ifdef CONFIG_IPIPE
++	struct ipipe_timer      *ipipe_timer;
++	unsigned                ipipe_stolen;
++
++#define clockevent_ipipe_stolen(evt) ((evt)->ipipe_stolen)
++#else
++#define clockevent_ipipe_stolen(evt) (0)
++#endif /* !CONFIG_IPIPE */
+ } ____cacheline_aligned;
+ 
+ /* Helpers to verify state of a clockevent device */
+diff --git a/include/linux/clocksource.h b/include/linux/clocksource.h
+index 7dff1963c..ffbdea2b2 100644
+--- a/include/linux/clocksource.h
++++ b/include/linux/clocksource.h
+@@ -107,6 +107,9 @@ struct clocksource {
+ 	u64 wd_last;
+ #endif
+ 	struct module *owner;
++#ifdef CONFIG_IPIPE_WANT_CLOCKSOURCE
++	u64 (*ipipe_read)(struct clocksource *cs);
++#endif /* CONFIG_IPIPE_WANT_CLOCKSOURCE */
+ };
+ 
+ /*
+diff --git a/include/linux/timekeeper_internal.h b/include/linux/timekeeper_internal.h
+index 97154c61e..ff8d7c7f6 100644
+--- a/include/linux/timekeeper_internal.h
++++ b/include/linux/timekeeper_internal.h
+@@ -135,7 +135,7 @@ extern void update_vsyscall_tz(void);
+ #elif defined(CONFIG_GENERIC_TIME_VSYSCALL_OLD)
+ 
+ extern void update_vsyscall_old(struct timespec *ts, struct timespec *wtm,
+-				struct clocksource *c, u32 mult,
++				struct clocksource *c, u32 mult, u32 shift,
+ 				u64 cycle_last);
+ extern void update_vsyscall_tz(void);
+ 
+diff --git a/include/linux/timekeeping.h b/include/linux/timekeeping.h
+index 0021575fe..33f283906 100644
+--- a/include/linux/timekeeping.h
++++ b/include/linux/timekeeping.h
+@@ -347,5 +347,13 @@ extern void read_boot_clock64(struct timespec64 *ts);
+ extern int update_persistent_clock(struct timespec now);
+ extern int update_persistent_clock64(struct timespec64 now);
+ 
++#ifdef CONFIG_IPIPE
++void update_root_process_times(struct pt_regs *regs);
++#else  /* !CONFIG_IPIPE */
++static inline void update_root_process_times(struct pt_regs *regs)
++{
++	update_process_times(user_mode(regs));
++}
++#endif /* CONFIG_IPIPE */
+ 
+ #endif
+diff --git a/kernel/time/clockevents.c b/kernel/time/clockevents.c
+index 4237e0744..fd6894aff 100644
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@ -17,6 +17,7 @@
+ #include <linux/module.h>
+ #include <linux/smp.h>
+ #include <linux/device.h>
++#include <linux/ipipe_tickdev.h>
+ 
+ #include "tick-internal.h"
+ 
+@@ -453,6 +454,8 @@ void clockevents_register_device(struct clock_event_device *dev)
+ 	/* Initialize state to DETACHED */
+ 	clockevent_set_state(dev, CLOCK_EVT_STATE_DETACHED);
+ 
++	ipipe_host_timer_register(dev);
++
+ 	if (!dev->cpumask) {
+ 		WARN_ON(num_possible_cpus() > 1);
+ 		dev->cpumask = cpumask_of(smp_processor_id());
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index 03918a19c..7cdccd7d8 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -32,6 +32,7 @@
+ #include <linux/sched.h> /* for spin_unlock_irq() using preempt_count() m68k */
+ #include <linux/tick.h>
+ #include <linux/kthread.h>
++#include <linux/kallsyms.h>
+ 
+ #include "tick-internal.h"
+ #include "timekeeping_internal.h"
+@@ -177,6 +178,9 @@ static void clocksource_watchdog(unsigned long data)
+ 	u64 csnow, wdnow, cslast, wdlast, delta;
+ 	int64_t wd_nsec, cs_nsec;
+ 	int next_cpu, reset_pending;
++#ifdef CONFIG_IPIPE
++	u64 wdref;
++#endif
+ 
+ 	spin_lock(&watchdog_lock);
+ 	if (!watchdog_running)
+@@ -193,11 +197,24 @@ static void clocksource_watchdog(unsigned long data)
+ 			continue;
+ 		}
+ 
++#ifdef CONFIG_IPIPE
++retry:
++#endif
+ 		local_irq_disable();
++#ifdef CONFIG_IPIPE
++		wdref = watchdog->read(watchdog);
++#endif
+ 		csnow = cs->read(cs);
+ 		wdnow = watchdog->read(watchdog);
+ 		local_irq_enable();
+ 
++#ifdef CONFIG_IPIPE
++		wd_nsec = clocksource_cyc2ns((wdnow - wdref) & watchdog->mask,
++					     watchdog->mult, watchdog->shift);
++		if (wd_nsec > WATCHDOG_THRESHOLD)
++			goto retry;
++#endif
++
+ 		/* Clocksource initialized ? */
+ 		if (!(cs->flags & CLOCK_SOURCE_WATCHDOG) ||
+ 		    atomic_read(&watchdog_reset_pending)) {
+@@ -678,6 +695,95 @@ static int __init clocksource_done_booting(void)
+ }
+ fs_initcall(clocksource_done_booting);
+ 
++#ifdef CONFIG_IPIPE_WANT_CLOCKSOURCE
++unsigned long long __ipipe_cs_freq;
++EXPORT_SYMBOL_GPL(__ipipe_cs_freq);
++
++struct clocksource *__ipipe_cs;
++EXPORT_SYMBOL_GPL(__ipipe_cs);
++
++u64 (*__ipipe_cs_read)(struct clocksource *cs);
++u64 __ipipe_cs_last_tsc;
++u64 __ipipe_cs_mask;
++unsigned __ipipe_cs_lat = 0xffffffff;
++
++static void ipipe_check_clocksource(struct clocksource *cs)
++{
++	u64 (*cread)(struct clocksource *cs);
++	u64 lat, mask, saved;
++	unsigned long long freq;
++	unsigned long flags;
++	unsigned i;
++
++	if (cs->ipipe_read) {
++		mask = CLOCKSOURCE_MASK(64);
++		cread = cs->ipipe_read;
++	} else {
++		mask = cs->mask;
++		cread = cs->read;
++
++		if ((cs->flags & CLOCK_SOURCE_IS_CONTINUOUS) == 0)
++			return;
++
++		/*
++		 * We only support masks such that cs->mask + 1 is a power of 2,
++		 * 64 bits masks or masks lesser than 32 bits
++		 */
++		if (mask != CLOCKSOURCE_MASK(64)
++		    && ((mask & (mask + 1)) != 0 || mask > 0xffffffff))
++			return;
++	}
++
++	/*
++	 * We prefer a clocksource with a better resolution than 1us
++	 */
++	if (cs->shift <= 34) {
++		freq = 1000000000ULL << cs->shift;
++		do_div(freq, cs->mult);
++	} else {
++		freq = 1000000ULL << cs->shift;
++		do_div(freq, cs->mult);
++		freq *= 1000;
++	}
++	if (freq < 1000000)
++		return;
++
++	/* Measure the clocksource latency */
++	flags = hard_local_irq_save();
++	saved = __ipipe_cs_last_tsc;
++	lat = cread(cs);
++	for (i = 0; i < 10; i++)
++		cread(cs);
++	lat = cread(cs) - lat;
++	__ipipe_cs_last_tsc = saved;
++	hard_local_irq_restore(flags);
++	lat = (lat * cs->mult) >> cs->shift;
++	do_div(lat, i + 1);
++
++	if (!strcmp(cs->name, override_name))
++		goto skip_tests;
++
++	if (lat > __ipipe_cs_lat)
++		return;
++
++	if (__ipipe_cs && !strcmp(__ipipe_cs->name, override_name))
++		return;
++
++  skip_tests:
++	flags = hard_local_irq_save();
++	if (__ipipe_cs_last_tsc == 0) {
++		__ipipe_cs_lat = lat;
++		__ipipe_cs_freq = freq;
++		__ipipe_cs = cs;
++		__ipipe_cs_read = cread;
++		__ipipe_cs_mask = mask;
++	}
++	hard_local_irq_restore(flags);
++}
++#else /* !CONFIG_IPIPE_WANT_CLOCKSOURCE */
++#define ipipe_check_clocksource(cs)	do { }while (0)
++#endif /* !CONFIG_IPIPE_WANT_CLOCKSOURCE */
++
+ /*
+  * Enqueue the clocksource sorted by rating
+  */
+@@ -693,6 +799,8 @@ static void clocksource_enqueue(struct clocksource *cs)
+ 		entry = &tmp->list;
+ 	}
+ 	list_add(&cs->list, entry);
++
++	ipipe_check_clocksource(cs);
+ }
+ 
+ /**
+diff --git a/kernel/time/tick-common.c b/kernel/time/tick-common.c
+index 49edc1c4f..9ab5c0e94 100644
+--- a/kernel/time/tick-common.c
++++ b/kernel/time/tick-common.c
+@@ -89,7 +89,7 @@ static void tick_periodic(int cpu)
+ 		update_wall_time();
+ 	}
+ 
+-	update_process_times(user_mode(get_irq_regs()));
++	update_root_process_times(get_irq_regs());
+ 	profile_tick(CPU_PROFILING);
+ }
+ 
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index dfa4a117f..849479493 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -158,7 +158,7 @@ static void tick_sched_handle(struct tick_sched *ts, struct pt_regs *regs)
+ 		ts->next_tick = 0;
+ 	}
+ #endif
+-	update_process_times(user_mode(regs));
++	update_root_process_times(regs);
+ 	profile_tick(CPU_PROFILING);
+ }
+ #endif
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 2cafb49aa..002c93975 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -525,7 +525,7 @@ static inline void update_vsyscall(struct timekeeper *tk)
+ 	xt = timespec64_to_timespec(tk_xtime(tk));
+ 	wm = timespec64_to_timespec(tk->wall_to_monotonic);
+ 	update_vsyscall_old(&xt, &wm, tk->tkr_mono.clock, tk->tkr_mono.mult,
+-			    tk->tkr_mono.cycle_last);
++			    tk->tkr_mono.shift, tk->tkr_mono.cycle_last);
+ }
+ 
+ static inline void old_vsyscall_fixup(struct timekeeper *tk)
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index db5e6daad..5edb5cb7d 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -22,6 +22,7 @@
+ #include <linux/kernel_stat.h>
+ #include <linux/export.h>
+ #include <linux/interrupt.h>
++#include <linux/ipipe.h>
+ #include <linux/percpu.h>
+ #include <linux/init.h>
+ #include <linux/mm.h>
+@@ -1621,6 +1622,24 @@ static inline void __run_timers(struct timer_base *base)
+ 	raw_spin_unlock_irq(&base->lock);
+ }
+ 
++#ifdef CONFIG_IPIPE
++
++void update_root_process_times(struct pt_regs *regs)
++{
++	int user_tick = user_mode(regs);
++
++	if (__ipipe_root_tick_p(regs)) {
++		update_process_times(user_tick);
++		return;
++	}
++
++	run_local_timers();
++	rcu_check_callbacks(user_tick);
++	run_posix_cpu_timers(current);
++}
++
++#endif
++
+ /*
+  * This function runs timers and the timer-tq in bottom half context.
+  */
+-- 
+2.17.1
+

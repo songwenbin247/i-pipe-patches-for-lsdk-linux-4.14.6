@@ -1,0 +1,401 @@
+From 1fea465228ff4b6f0cf6efc005692d989bf4c168 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 3 Dec 2017 12:08:28 +0100
+Subject: [PATCH 04/29] lib, kernel: ipipe: hard protect against preemption by
+ head domain
+
+---
+ include/asm-generic/atomic.h        |  8 ++++----
+ include/asm-generic/bitops/atomic.h |  8 ++++----
+ include/asm-generic/cmpxchg-local.h |  8 ++++----
+ kernel/context_tracking.c           |  4 ++--
+ kernel/debug/debug_core.c           | 18 ++++++++++--------
+ kernel/module.c                     |  8 ++++----
+ kernel/power/hibernate.c            |  3 +++
+ lib/atomic64.c                      | 24 ++++++++++++------------
+ lib/smp_processor_id.c              |  7 +++++++
+ 9 files changed, 50 insertions(+), 38 deletions(-)
+
+diff --git a/include/asm-generic/atomic.h b/include/asm-generic/atomic.h
+index 3f38eb036..4f872ce00 100644
+--- a/include/asm-generic/atomic.h
++++ b/include/asm-generic/atomic.h
+@@ -82,9 +82,9 @@ static inline void atomic_##op(int i, atomic_t *v)			\
+ {									\
+ 	unsigned long flags;						\
+ 									\
+-	raw_local_irq_save(flags);					\
++	flags = hard_local_irq_save();					\
+ 	v->counter = v->counter c_op i;					\
+-	raw_local_irq_restore(flags);					\
++	hard_local_irq_restore(flags);					\
+ }
+ 
+ #define ATOMIC_OP_RETURN(op, c_op)					\
+@@ -93,9 +93,9 @@ static inline int atomic_##op##_return(int i, atomic_t *v)		\
+ 	unsigned long flags;						\
+ 	int ret;							\
+ 									\
+-	raw_local_irq_save(flags);					\
++	flags = hard_local_irq_save();					\
+ 	ret = (v->counter = v->counter c_op i);				\
+-	raw_local_irq_restore(flags);					\
++	hard_local_irq_restore(flags);					\
+ 									\
+ 	return ret;							\
+ }
+diff --git a/include/asm-generic/bitops/atomic.h b/include/asm-generic/bitops/atomic.h
+index 04deffaf5..73cadd743 100644
+--- a/include/asm-generic/bitops/atomic.h
++++ b/include/asm-generic/bitops/atomic.h
+@@ -22,20 +22,20 @@ extern arch_spinlock_t __atomic_hash[ATOMIC_HASH_SIZE] __lock_aligned;
+  * this is the substitute */
+ #define _atomic_spin_lock_irqsave(l,f) do {	\
+ 	arch_spinlock_t *s = ATOMIC_HASH(l);	\
+-	local_irq_save(f);			\
++	(f) = hard_local_irq_save();		\
+ 	arch_spin_lock(s);			\
+ } while(0)
+ 
+ #define _atomic_spin_unlock_irqrestore(l,f) do {	\
+ 	arch_spinlock_t *s = ATOMIC_HASH(l);		\
+ 	arch_spin_unlock(s);				\
+-	local_irq_restore(f);				\
++	hard_local_irq_restore(f);			\
+ } while(0)
+ 
+ 
+ #else
+-#  define _atomic_spin_lock_irqsave(l,f) do { local_irq_save(f); } while (0)
+-#  define _atomic_spin_unlock_irqrestore(l,f) do { local_irq_restore(f); } while (0)
++#  define _atomic_spin_lock_irqsave(l,f) do { (f) = hard_local_irq_save(); } while (0)
++#  define _atomic_spin_unlock_irqrestore(l,f) do { hard_local_irq_restore(f); } while (0)
+ #endif
+ 
+ /*
+diff --git a/include/asm-generic/cmpxchg-local.h b/include/asm-generic/cmpxchg-local.h
+index f17f14f84..67d712ff0 100644
+--- a/include/asm-generic/cmpxchg-local.h
++++ b/include/asm-generic/cmpxchg-local.h
+@@ -23,7 +23,7 @@ static inline unsigned long __cmpxchg_local_generic(volatile void *ptr,
+ 	if (size == 8 && sizeof(unsigned long) != 8)
+ 		wrong_size_cmpxchg(ptr);
+ 
+-	raw_local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 	switch (size) {
+ 	case 1: prev = *(u8 *)ptr;
+ 		if (prev == old)
+@@ -44,7 +44,7 @@ static inline unsigned long __cmpxchg_local_generic(volatile void *ptr,
+ 	default:
+ 		wrong_size_cmpxchg(ptr);
+ 	}
+-	raw_local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ 	return prev;
+ }
+ 
+@@ -57,11 +57,11 @@ static inline u64 __cmpxchg64_local_generic(volatile void *ptr,
+ 	u64 prev;
+ 	unsigned long flags;
+ 
+-	raw_local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 	prev = *(u64 *)ptr;
+ 	if (prev == old)
+ 		*(u64 *)ptr = new;
+-	raw_local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ 	return prev;
+ }
+ 
+diff --git a/kernel/context_tracking.c b/kernel/context_tracking.c
+index 9ad37b9e4..b123fad0a 100644
+--- a/kernel/context_tracking.c
++++ b/kernel/context_tracking.c
+@@ -113,7 +113,7 @@ void context_tracking_enter(enum ctx_state state)
+ 	 * helpers are enough to protect RCU uses inside the exception. So
+ 	 * just return immediately if we detect we are in an IRQ.
+ 	 */
+-	if (in_interrupt())
++	if (!ipipe_root_p || in_interrupt())
+ 		return;
+ 
+ 	local_irq_save(flags);
+@@ -169,7 +169,7 @@ void context_tracking_exit(enum ctx_state state)
+ {
+ 	unsigned long flags;
+ 
+-	if (in_interrupt())
++	if (!ipipe_root_p || in_interrupt())
+ 		return;
+ 
+ 	local_irq_save(flags);
+diff --git a/kernel/debug/debug_core.c b/kernel/debug/debug_core.c
+index 65c0f1363..819a6c4e9 100644
+--- a/kernel/debug/debug_core.c
++++ b/kernel/debug/debug_core.c
+@@ -119,8 +119,8 @@ static struct kgdb_bkpt		kgdb_break[KGDB_MAX_BREAKPOINTS] = {
+  */
+ atomic_t			kgdb_active = ATOMIC_INIT(-1);
+ EXPORT_SYMBOL_GPL(kgdb_active);
+-static DEFINE_RAW_SPINLOCK(dbg_master_lock);
+-static DEFINE_RAW_SPINLOCK(dbg_slave_lock);
++static IPIPE_DEFINE_RAW_SPINLOCK(dbg_master_lock);
++static IPIPE_DEFINE_RAW_SPINLOCK(dbg_slave_lock);
+ 
+ /*
+  * We use NR_CPUs not PERCPU, in case kgdb is used to debug early
+@@ -461,7 +461,9 @@ static int kgdb_reenter_check(struct kgdb_state *ks)
+ static void dbg_touch_watchdogs(void)
+ {
+ 	touch_softlockup_watchdog_sync();
++#ifndef CONFIG_IPIPE
+ 	clocksource_touch_watchdog();
++#endif
+ 	rcu_cpu_stall_reset();
+ }
+ 
+@@ -492,7 +494,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 	 * Interrupts will be restored by the 'trap return' code, except when
+ 	 * single stepping.
+ 	 */
+-	local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 
+ 	cpu = ks->cpu;
+ 	kgdb_info[cpu].debuggerinfo = regs;
+@@ -541,7 +543,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 			smp_mb__before_atomic();
+ 			atomic_dec(&slaves_in_kgdb);
+ 			dbg_touch_watchdogs();
+-			local_irq_restore(flags);
++			hard_local_irq_restore(flags);
+ 			return 0;
+ 		}
+ 		cpu_relax();
+@@ -559,7 +561,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 		atomic_set(&kgdb_active, -1);
+ 		raw_spin_unlock(&dbg_master_lock);
+ 		dbg_touch_watchdogs();
+-		local_irq_restore(flags);
++		hard_local_irq_restore(flags);
+ 
+ 		goto acquirelock;
+ 	}
+@@ -676,7 +678,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 	atomic_set(&kgdb_active, -1);
+ 	raw_spin_unlock(&dbg_master_lock);
+ 	dbg_touch_watchdogs();
+-	local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ 
+ 	return kgdb_info[cpu].ret_state;
+ }
+@@ -795,9 +797,9 @@ static void kgdb_console_write(struct console *co, const char *s,
+ 	if (!kgdb_connected || atomic_read(&kgdb_active) != -1 || dbg_kdb_mode)
+ 		return;
+ 
+-	local_irq_save(flags);
++	flags = hard_local_irq_save();
+ 	gdbstub_msg_write(s, count);
+-	local_irq_restore(flags);
++	hard_local_irq_restore(flags);
+ }
+ 
+ static struct console kgdbcons = {
+diff --git a/kernel/module.c b/kernel/module.c
+index de66ec825..c770e6e79 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1109,7 +1109,7 @@ bool try_module_get(struct module *module)
+ 	bool ret = true;
+ 
+ 	if (module) {
+-		preempt_disable();
++		unsigned long flags = hard_preempt_disable();
+ 		/* Note: here, we can fail to get a reference */
+ 		if (likely(module_is_live(module) &&
+ 			   atomic_inc_not_zero(&module->refcnt) != 0))
+@@ -1117,7 +1117,7 @@ bool try_module_get(struct module *module)
+ 		else
+ 			ret = false;
+ 
+-		preempt_enable();
++		hard_preempt_enable(flags);
+ 	}
+ 	return ret;
+ }
+@@ -1128,11 +1128,11 @@ void module_put(struct module *module)
+ 	int ret;
+ 
+ 	if (module) {
+-		preempt_disable();
++		unsigned long flags = hard_preempt_disable();
+ 		ret = atomic_dec_if_positive(&module->refcnt);
+ 		WARN_ON(ret < 0);	/* Failed to put refcount */
+ 		trace_module_put(module, _RET_IP_);
+-		preempt_enable();
++		hard_preempt_enable(flags);
+ 	}
+ }
+ EXPORT_SYMBOL(module_put);
+diff --git a/kernel/power/hibernate.c b/kernel/power/hibernate.c
+index a5c36e9c5..6a2818e4e 100644
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -286,6 +286,7 @@ static int create_image(int platform_mode)
+ 		goto Enable_cpus;
+ 
+ 	local_irq_disable();
++	hard_cond_local_irq_disable();
+ 
+ 	error = syscore_suspend();
+ 	if (error) {
+@@ -445,6 +446,7 @@ static int resume_target_kernel(bool platform_mode)
+ 		goto Enable_cpus;
+ 
+ 	local_irq_disable();
++	hard_cond_local_irq_disable();
+ 
+ 	error = syscore_suspend();
+ 	if (error)
+@@ -563,6 +565,7 @@ int hibernation_platform_enter(void)
+ 		goto Enable_cpus;
+ 
+ 	local_irq_disable();
++	hard_cond_local_irq_disable();
+ 	syscore_suspend();
+ 	if (pm_wakeup_pending()) {
+ 		error = -EAGAIN;
+diff --git a/lib/atomic64.c b/lib/atomic64.c
+index 53c2d5edc..12403ac98 100644
+--- a/lib/atomic64.c
++++ b/lib/atomic64.c
+@@ -29,15 +29,15 @@
+  * Ensure each lock is in a separate cacheline.
+  */
+ static union {
+-	raw_spinlock_t lock;
++	ipipe_spinlock_t lock;
+ 	char pad[L1_CACHE_BYTES];
+ } atomic64_lock[NR_LOCKS] __cacheline_aligned_in_smp = {
+ 	[0 ... (NR_LOCKS - 1)] = {
+-		.lock =  __RAW_SPIN_LOCK_UNLOCKED(atomic64_lock.lock),
++		.lock =  IPIPE_SPIN_LOCK_UNLOCKED,
+ 	},
+ };
+ 
+-static inline raw_spinlock_t *lock_addr(const atomic64_t *v)
++static inline ipipe_spinlock_t *lock_addr(const atomic64_t *v)
+ {
+ 	unsigned long addr = (unsigned long) v;
+ 
+@@ -49,7 +49,7 @@ static inline raw_spinlock_t *lock_addr(const atomic64_t *v)
+ long long atomic64_read(const atomic64_t *v)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	ipipe_spinlock_t *lock = lock_addr(v);
+ 	long long val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -62,7 +62,7 @@ EXPORT_SYMBOL(atomic64_read);
+ void atomic64_set(atomic64_t *v, long long i)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	ipipe_spinlock_t *lock = lock_addr(v);
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+ 	v->counter = i;
+@@ -74,7 +74,7 @@ EXPORT_SYMBOL(atomic64_set);
+ void atomic64_##op(long long a, atomic64_t *v)				\
+ {									\
+ 	unsigned long flags;						\
+-	raw_spinlock_t *lock = lock_addr(v);				\
++	ipipe_spinlock_t *lock = lock_addr(v);				\
+ 									\
+ 	raw_spin_lock_irqsave(lock, flags);				\
+ 	v->counter c_op a;						\
+@@ -86,7 +86,7 @@ EXPORT_SYMBOL(atomic64_##op);
+ long long atomic64_##op##_return(long long a, atomic64_t *v)		\
+ {									\
+ 	unsigned long flags;						\
+-	raw_spinlock_t *lock = lock_addr(v);				\
++	ipipe_spinlock_t *lock = lock_addr(v);				\
+ 	long long val;							\
+ 									\
+ 	raw_spin_lock_irqsave(lock, flags);				\
+@@ -100,7 +100,7 @@ EXPORT_SYMBOL(atomic64_##op##_return);
+ long long atomic64_fetch_##op(long long a, atomic64_t *v)		\
+ {									\
+ 	unsigned long flags;						\
+-	raw_spinlock_t *lock = lock_addr(v);				\
++	ipipe_spinlock_t *lock = lock_addr(v);				\
+ 	long long val;							\
+ 									\
+ 	raw_spin_lock_irqsave(lock, flags);				\
+@@ -137,7 +137,7 @@ ATOMIC64_OPS(xor, ^=)
+ long long atomic64_dec_if_positive(atomic64_t *v)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	ipipe_spinlock_t *lock = lock_addr(v);
+ 	long long val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -152,7 +152,7 @@ EXPORT_SYMBOL(atomic64_dec_if_positive);
+ long long atomic64_cmpxchg(atomic64_t *v, long long o, long long n)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	ipipe_spinlock_t *lock = lock_addr(v);
+ 	long long val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -167,7 +167,7 @@ EXPORT_SYMBOL(atomic64_cmpxchg);
+ long long atomic64_xchg(atomic64_t *v, long long new)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	ipipe_spinlock_t *lock = lock_addr(v);
+ 	long long val;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+@@ -181,7 +181,7 @@ EXPORT_SYMBOL(atomic64_xchg);
+ int atomic64_add_unless(atomic64_t *v, long long a, long long u)
+ {
+ 	unsigned long flags;
+-	raw_spinlock_t *lock = lock_addr(v);
++	ipipe_spinlock_t *lock = lock_addr(v);
+ 	int ret = 0;
+ 
+ 	raw_spin_lock_irqsave(lock, flags);
+diff --git a/lib/smp_processor_id.c b/lib/smp_processor_id.c
+index 835cc6df2..2de29f890 100644
+--- a/lib/smp_processor_id.c
++++ b/lib/smp_processor_id.c
+@@ -7,12 +7,19 @@
+ #include <linux/export.h>
+ #include <linux/kallsyms.h>
+ #include <linux/sched.h>
++#include <linux/ipipe.h>
+ 
+ notrace static unsigned int check_preemption_disabled(const char *what1,
+ 							const char *what2)
+ {
+ 	int this_cpu = raw_smp_processor_id();
+ 
++	if (hard_irqs_disabled())
++		goto out;
++
++	if (!ipipe_root_p)
++		goto out;
++
+ 	if (likely(preempt_count()))
+ 		goto out;
+ 
+-- 
+2.17.1
+

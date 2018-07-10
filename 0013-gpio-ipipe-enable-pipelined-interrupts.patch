@@ -1,0 +1,25 @@
+From ee04238bc22ad1b2439c7836e47fdd4b3f91200b Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Sun, 3 Dec 2017 11:56:22 +0100
+Subject: [PATCH 13/29] gpio: ipipe: enable pipelined interrupts
+
+---
+ include/linux/gpio/driver.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/linux/gpio/driver.h b/include/linux/gpio/driver.h
+index 424e5139f..028ba4aef 100644
+--- a/include/linux/gpio/driver.h
++++ b/include/linux/gpio/driver.h
+@@ -154,7 +154,7 @@ struct gpio_chip {
+ 	void __iomem *reg_clr;
+ 	void __iomem *reg_dir;
+ 	int bgpio_bits;
+-	spinlock_t bgpio_lock;
++	ipipe_spinlock_t bgpio_lock;
+ 	unsigned long bgpio_data;
+ 	unsigned long bgpio_dir;
+ #endif
+-- 
+2.17.1
+

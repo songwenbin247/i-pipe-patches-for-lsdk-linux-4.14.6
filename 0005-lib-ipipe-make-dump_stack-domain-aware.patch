@@ -1,0 +1,87 @@
+From 61ec2f51aec5c8d4745296bed35e387bb864a403 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 9 Nov 2017 12:24:04 +0100
+Subject: [PATCH 05/29] lib: ipipe: make dump_stack() domain-aware
+
+When dumping a stack backtrace, we neither need nor want to disable
+root stage IRQs over the head stage, where CPU migration can't
+happen.
+
+Conversely, we neither need nor want to disable hard IRQs from the
+head stage, so that latency won't skyrocket either.
+---
+ lib/dump_stack.c | 30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/lib/dump_stack.c b/lib/dump_stack.c
+index c5edbedd3..898178dc6 100644
+--- a/lib/dump_stack.c
++++ b/lib/dump_stack.c
+@@ -10,6 +10,7 @@
+ #include <linux/sched/debug.h>
+ #include <linux/smp.h>
+ #include <linux/atomic.h>
++#include <linux/ipipe.h>
+ 
+ static void __dump_stack(void)
+ {
+@@ -25,6 +26,29 @@ static void __dump_stack(void)
+ #ifdef CONFIG_SMP
+ static atomic_t dump_lock = ATOMIC_INIT(-1);
+ 
++static unsigned long disable_local_irqs(void)
++{
++	unsigned long flags = 0; /* only to trick the UMR detection */
++
++	/*
++	 * We neither need nor want to disable root stage IRQs over
++	 * the head stage, where CPU migration can't
++	 * happen. Conversely, we neither need nor want to disable
++	 * hard IRQs from the head stage, so that latency won't
++	 * skyrocket as a result of dumping the stack backtrace.
++	 */
++	if (ipipe_root_p)
++		local_irq_save(flags);
++
++	return flags;
++}
++
++static void restore_local_irqs(unsigned long flags)
++{
++	if (ipipe_root_p)
++		local_irq_restore(flags);
++}
++
+ asmlinkage __visible void dump_stack(void)
+ {
+ 	unsigned long flags;
+@@ -37,7 +61,7 @@ asmlinkage __visible void dump_stack(void)
+ 	 * against other CPUs
+ 	 */
+ retry:
+-	local_irq_save(flags);
++	flags = disable_local_irqs();
+ 	cpu = smp_processor_id();
+ 	old = atomic_cmpxchg(&dump_lock, -1, cpu);
+ 	if (old == -1) {
+@@ -45,7 +69,7 @@ asmlinkage __visible void dump_stack(void)
+ 	} else if (old == cpu) {
+ 		was_locked = 1;
+ 	} else {
+-		local_irq_restore(flags);
++		restore_local_irqs(flags);
+ 		cpu_relax();
+ 		goto retry;
+ 	}
+@@ -55,7 +79,7 @@ asmlinkage __visible void dump_stack(void)
+ 	if (!was_locked)
+ 		atomic_set(&dump_lock, -1);
+ 
+-	local_irq_restore(flags);
++	restore_local_irqs(flags);
+ }
+ #else
+ asmlinkage __visible void dump_stack(void)
+-- 
+2.17.1
+

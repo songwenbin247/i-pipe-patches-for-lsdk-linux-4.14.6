@@ -1,0 +1,45 @@
+From ec270e744a617db6abf040f2570aec0d1142f317 Mon Sep 17 00:00:00 2001
+From: Philippe Gerum <rpm@xenomai.org>
+Date: Thu, 28 Dec 2017 20:19:42 -0800
+Subject: [PATCH 16/29] ARM64: ipipe: hard protect against preemption by head
+ domain
+
+---
+ arch/arm64/kernel/signal.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index 0bdc96c61..eaab6a4a3 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -744,12 +744,17 @@ static void do_signal(struct pt_regs *regs)
+ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 				 unsigned int thread_flags)
+ {
++#ifdef CONFIG_IPIPE
++	local_irq_disable();
++	hard_local_irq_enable();
++#else
+ 	/*
+ 	 * The assembly code enters us with IRQs off, but it hasn't
+ 	 * informed the tracing code of that for efficiency reasons.
+ 	 * Update the trace code with the current status.
+ 	 */
+ 	trace_hardirqs_off();
++#endif
+ 
+ 	do {
+ 		/* Check valid user FS if needed */
+@@ -778,4 +783,9 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 		local_irq_disable();
+ 		thread_flags = READ_ONCE(current_thread_info()->flags);
+ 	} while (thread_flags & _TIF_WORK_MASK);
++
++#ifdef CONFIG_IPIPE
++	local_irq_enable();
++	hard_local_irq_disable();
++#endif
+ }
+-- 
+2.17.1
+
